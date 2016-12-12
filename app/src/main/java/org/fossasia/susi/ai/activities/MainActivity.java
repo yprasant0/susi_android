@@ -17,6 +17,7 @@ import android.graphics.drawable.Drawable;
 import android.media.AudioManager;
 import android.net.ConnectivityManager;
 import android.net.Uri;
+import android.os.AsyncTask;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -73,7 +74,9 @@ import org.fossasia.susi.ai.rest.model.LocationResponse;
 import org.fossasia.susi.ai.rest.model.SusiResponse;
 
 import java.io.ByteArrayOutputStream;
+import java.io.File;
 import java.io.FileNotFoundException;
+import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Date;
@@ -86,6 +89,11 @@ import java.util.regex.Matcher;
 
 import butterknife.BindView;
 import butterknife.ButterKnife;
+import edu.cmu.pocketsphinx.Assets;
+import edu.cmu.pocketsphinx.Hypothesis;
+import edu.cmu.pocketsphinx.RecognitionListener;
+import edu.cmu.pocketsphinx.SpeechRecognizer;
+import edu.cmu.pocketsphinx.SpeechRecognizerSetup;
 import io.realm.Case;
 import io.realm.Realm;
 import io.realm.RealmList;
@@ -96,15 +104,19 @@ import retrofit2.Response;
 
 import static android.media.AudioManager.AUDIOFOCUS_LOSS_TRANSIENT;
 
-public class MainActivity extends AppCompatActivity {
+public class MainActivity extends AppCompatActivity{
 
     public static String TAG = MainActivity.class.getName();
 
     private final int REQ_CODE_SPEECH_INPUT = 100;
     private final int SELECT_PICTURE = 200;
     private final int CROP_PICTURE = 400;
-    private  boolean atHome = true;
+    private boolean atHome = true;
     private boolean backPressedOnce = false;
+    private static final String KWS_SEARCH = "wakeup";
+    private static final String KEYPHRASE = "hello";
+    private static final int PERMISSIONS_REQUEST_RECORD_AUDIO = 1;
+    private SpeechRecognizer recognizer;
 
     @BindView(R.id.coordinator_layout)
     CoordinatorLayout coordinatorLayout;
@@ -124,8 +136,8 @@ public class MainActivity extends AppCompatActivity {
     @BindView(R.id.date)
     TextView dates;
 
-	private FloatingActionButton fab_scrollToEnd;
-//	 Global Variables used for the setMessage Method
+    private FloatingActionButton fab_scrollToEnd;
+    //	 Global Variables used for the setMessage Method
     private String answer;
     private boolean ismap, isPieChart = false;
     private boolean isHavingLink;
@@ -135,7 +147,7 @@ public class MainActivity extends AppCompatActivity {
     private RealmResults<ChatMessage> chatMessageDatabaseList;
     private Boolean micCheck;
     private SearchView searchView;
-    private  Boolean check;
+    private Boolean check;
     private Menu menu;
     private int pointer;
     private RealmResults<ChatMessage> results;
@@ -176,9 +188,10 @@ public class MainActivity extends AppCompatActivity {
                             case R.id.btnSpeak:
                                 String chat_message = ChatMessage.getText().toString();
                                 chat_message = chat_message.trim();
-                                String splits[]=chat_message.split("\n");
-                                String message="";
-                                for (String split : splits) message = message.concat(split).concat(" ");
+                                String splits[] = chat_message.split("\n");
+                                String message = "";
+                                for (String split : splits)
+                                    message = message.concat(split).concat(" ");
                                 if (!TextUtils.isEmpty(chat_message)) {
                                     sendMessage(message);
                                     ChatMessage.setText("");
@@ -229,7 +242,6 @@ public class MainActivity extends AppCompatActivity {
     }
 
 
-
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -248,6 +260,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void promptSpeechInput() {
+        recognizer.stop();
         Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
         intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL,
                 RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
@@ -411,6 +424,12 @@ public class MainActivity extends AppCompatActivity {
             }
         });
         setChatBackground();
+        int permissionCheck = ContextCompat.checkSelfPermission(getApplicationContext(), Manifest.permission.RECORD_AUDIO);
+        if (permissionCheck == PackageManager.PERMISSION_DENIED) {
+            ActivityCompat.requestPermissions(this, new String[]{Manifest.permission.RECORD_AUDIO}, PERMISSIONS_REQUEST_RECORD_AUDIO);
+            return;
+        }
+        new hotwordRecognizer().run();
     }
 
     public void getLocationFromIP() {
@@ -705,7 +724,7 @@ public class MainActivity extends AppCompatActivity {
                                             isHavingLink = urlList != null;
                                             if (urlList.size() == 0) isHavingLink = false;
                                         } catch (IndexOutOfBoundsException | NullPointerException e) {
-                                            Log.d(TAG, e.getLocalizedMessage());
+                                            Log.d(TAG, e.getLocalizedMessage() == null ? "" : e.getLocalizedMessage());
                                             answer = getString(R.string.error_occurred_try_again);
                                             isHavingLink = false;
                                         }
@@ -747,6 +766,8 @@ public class MainActivity extends AppCompatActivity {
                                             @Override
                                             public void run() {
                                                 addNewMessage(setMessage, ismap, isHavingLink, isPieChart, isSearchResult, datumList);
+                                                String searchName = KWS_SEARCH;
+                                                recognizer.startListening(searchName);
                                             }
                                         }, delay);
 
@@ -1099,6 +1120,108 @@ public class MainActivity extends AppCompatActivity {
     private class computeThread extends Thread {
         public void run() {
             computeOtherMessage();
+        }
+    }
+
+    private class hotwordRecognizer implements Runnable,RecognitionListener{
+
+        @Override
+        public void run() {
+            new AsyncTask<Void, Void, Exception>() {
+                @Override
+                protected Exception doInBackground(Void... params) {
+                    try {
+                        Assets assets = new Assets(MainActivity.this);
+                        File assetDir = assets.syncAssets();
+                        setupRecognizer(assetDir);
+                    } catch (IOException e) {
+                        return e;
+                    }
+                    return null;
+                }
+
+                @Override
+                protected void onPostExecute(Exception result) {
+                    if (result != null) {
+                        Toast.makeText(getApplicationContext(), "failed", Toast.LENGTH_SHORT).show();
+                    } else {
+                        switchSearch(KWS_SEARCH);
+                    }
+                }
+            }.execute();
+
+        }
+
+        @Override
+        public void onPartialResult(Hypothesis hypothesis) {
+            if (hypothesis == null)
+                return;
+
+            String text = hypothesis.getHypstr();
+            if (text.equals(KEYPHRASE)) {
+                promptSpeechInput();
+            }
+        }
+
+        /**
+         * This callback is called when we stop the recognizer.
+         */
+        @Override
+        public void onResult(Hypothesis hypothesis) {
+        }
+
+        @Override
+        public void onBeginningOfSpeech() {
+        }
+
+        /**
+         * We stop recognizer here to get a final result
+         */
+        @Override
+        public void onEndOfSpeech() {
+            if (!recognizer.getSearchName().equals(KWS_SEARCH))
+                switchSearch(KWS_SEARCH);
+        }
+
+        private void switchSearch(String searchName) {
+            recognizer.stop();
+
+            // If we are not spotting, start listening with timeout (10000 ms or 10 seconds).
+            if (searchName.equals(KWS_SEARCH))
+                recognizer.startListening(searchName);
+            else
+                recognizer.startListening(searchName, 10000);
+
+        }
+
+        private void setupRecognizer(File assetsDir) throws IOException {
+            // The recognizer can be configured to perform multiple searches
+            // of different kind and switch between them
+
+            recognizer = SpeechRecognizerSetup.defaultSetup()
+                    .setAcousticModel(new File(assetsDir, "en-us-ptm"))
+                    .setDictionary(new File(assetsDir, "cmudict-en-us.dict"))
+
+                    .setRawLogDir(assetsDir) // To disable logging of raw audio comment out this call (takes a lot of space on the device)
+
+                    .getRecognizer();
+            recognizer.addListener(this);
+
+            /** In your application you might not need to add all those searches.
+             * They are added here for demonstration. You can leave just one.
+             */
+
+            // Create keyword-activation search.
+            recognizer.addKeyphraseSearch(KWS_SEARCH, KEYPHRASE);
+        }
+
+        @Override
+        public void onError(Exception error) {
+        }
+
+        @Override
+        public void onTimeout() {
+            switchSearch(KWS_SEARCH);
         }
     }
 
